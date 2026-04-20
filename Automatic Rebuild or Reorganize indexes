@@ -1,0 +1,310 @@
+DECLARE
+     @databaseToCheck   VARCHAR(250)    = NULL --= all databases
+    ,@reportOnly        BIT             = 1     --  Default to report-only (safe default)
+
+DECLARE @isSysAdmin INT
+
+SET @isSysAdmin = (
+    SELECT IS_SRVROLEMEMBER('sysadmin')
+)
+
+IF @isSysAdmin = 1
+BEGIN
+    DECLARE @dbname                     NVARCHAR(128)
+    DECLARE @ReorganizeOrRebuildCommand NVARCHAR(MAX)
+    DECLARE @dbid                       INT
+    DECLARE @indexFillFactor            INT            
+    DECLARE @fragmentationThreshold     DECIMAL(5,2)   
+    DECLARE @indexStatisticsScanningMode VARCHAR(20)
+    DECLARE @verboseMode                BIT
+    DECLARE @sortInTempdb               VARCHAR(3)
+    DECLARE @isHadrEnabled              BIT
+    DECLARE @dynamic_command            NVARCHAR(1024)
+    DECLARE @dynamic_command_get_tables NVARCHAR(MAX)
+    DECLARE @ErrorMessage               NVARCHAR(4000)  
+
+    -- Initializations
+    SET @dynamic_command            = NULL
+    SET @dynamic_command_get_tables = NULL
+    SET @isHadrEnabled              = 0
+    SET NOCOUNT ON
+
+    SET @fragmentationThreshold         = 15.0
+    SET @indexFillFactor                = 70
+    SET @indexStatisticsScanningMode    = 'LIMITED'
+    SET @sortInTempdb                   = 'ON'
+    SET @verboseMode                    = 0
+
+    IF @verboseMode = 1 AND @databaseToCheck IS NOT NULL
+        PRINT 'Checking if database [' + @databaseToCheck + '] exists and has compatibility level >= SQL 2005 (90)'
+
+    -- Validate specified database
+    IF @databaseToCheck IS NOT NULL
+    BEGIN
+        DECLARE @dbExistsCheck INT
+        SET @dbExistsCheck = (
+            SELECT COUNT(*)
+            FROM master.sys.databases
+            WHERE [name] = RTRIM(@databaseToCheck)
+        )
+
+        IF @dbExistsCheck < 1
+            RAISERROR(
+                'Error: Database [%s] does not exist.',
+                20, 1, @databaseToCheck
+            ) WITH LOG
+
+        DECLARE @dbCompatCheck INT
+        SET @dbCompatCheck = (
+            SELECT [compatibility_level]
+            FROM master.sys.databases
+            WHERE [name] = RTRIM(@databaseToCheck)
+        )
+
+        IF @dbCompatCheck < 90
+            RAISERROR(
+                'Error: Database [%s] must have SQL Server 2005 or later compatibility level (>= 90).',
+                20, 1, @databaseToCheck
+            ) WITH LOG
+    END
+
+    IF @verboseMode = 1
+        PRINT 'Initial checks completed with no errors.'
+
+    -- Temp table for fragmented index details
+    IF OBJECT_ID('tempdb..#tmpFragmentedIndexes') IS NULL
+    BEGIN
+        CREATE TABLE #tmpFragmentedIndexes (
+             [dbName]                       SYSNAME
+            ,[tableName]                    SYSNAME
+            ,[schemaName]                   SYSNAME
+            ,[indexName]                    SYSNAME
+            ,[databaseID]                   SMALLINT
+            ,[objectID]                     INT
+            ,[indexID]                      INT
+            ,[PageCount]                    INT
+            ,[AvgFragmentationPercentage]   FLOAT
+            ,[reorganizationOrRebuildCommand] NVARCHAR(MAX)
+            ,[actionType]                   VARCHAR(20)  -- 'REBUILD' or 'REORGANIZE'
+        )
+    END
+
+    DELETE FROM #tmpFragmentedIndexes
+
+    IF @sortInTempdb NOT IN ('ON', 'OFF')
+        SET @sortInTempdb = 'ON'
+
+    SET @isHadrEnabled = CAST((
+        SELECT ISNULL(SERVERPROPERTY('IsHadrEnabled'), 0)
+    ) AS BIT)
+
+    -- Build cursor based on HADR state and target database
+    IF @isHadrEnabled = 0
+    BEGIN
+        IF @databaseToCheck IS NULL
+        BEGIN
+            DECLARE dbNames_cursor CURSOR FOR
+            SELECT s.[name], s.database_id
+            FROM master.sys.databases s
+            WHERE s.state_desc = 'ONLINE'
+              AND s.is_read_only != 1
+              AND s.[name] NOT IN ('master','model','msdb','tempdb','distribution')
+              AND s.[compatibility_level] >= 90
+            ORDER BY s.database_id
+        END
+        ELSE
+        BEGIN
+            DECLARE dbNames_cursor CURSOR FOR
+            SELECT s.[name], s.database_id
+            FROM master.sys.databases s
+            WHERE s.state_desc = 'ONLINE'
+              AND s.is_read_only != 1
+              AND s.[name] = RTRIM(@databaseToCheck)
+        END
+    END
+    ELSE
+    -- AlwaysOn enabled: exclude secondary replicas
+    BEGIN
+        IF @databaseToCheck IS NULL
+        BEGIN
+            DECLARE dbNames_cursor CURSOR FOR
+            SELECT s.[name], s.database_id
+            FROM master.sys.databases s
+            LEFT JOIN master.sys.dm_hadr_availability_replica_states r
+                ON s.replica_id = r.replica_id
+            WHERE s.state_desc = 'ONLINE'
+              AND s.is_read_only != 1
+              AND UPPER(ISNULL(r.role_desc, 'NonHadrEnabled')) NOT LIKE 'SECONDARY'
+              AND s.[name] NOT IN ('master','model','msdb','tempdb','distribution')
+              AND s.[compatibility_level] >= 90
+            ORDER BY s.database_id
+        END
+        ELSE
+        BEGIN
+            DECLARE dbNames_cursor CURSOR FOR
+            SELECT s.[name], s.database_id
+            FROM master.sys.databases s
+            LEFT JOIN master.sys.dm_hadr_availability_replica_states r
+                ON s.replica_id = r.replica_id
+            WHERE s.state_desc = 'ONLINE'
+              AND s.is_read_only != 1
+              AND UPPER(ISNULL(r.role_desc, 'NonHadrEnabled')) NOT LIKE 'SECONDARY'
+              AND s.[name] = RTRIM(@databaseToCheck)
+        END
+    END
+
+    OPEN dbNames_cursor
+
+    FETCH NEXT FROM dbNames_cursor INTO @dbname, @dbid
+
+    WHILE @@fetch_status = 0
+    BEGIN
+        IF @verboseMode = 1
+        BEGIN
+            PRINT ''
+            PRINT 'Gathering index fragmentation statistics for: [' + @dbname + '] (id: ' + CAST(@dbid AS VARCHAR(10)) + ')'
+        END
+
+        SET @dynamic_command_get_tables = N'
+USE [' + @dbname + N'];
+INSERT INTO #tmpFragmentedIndexes (
+     [dbName]
+    ,[tableName]
+    ,[schemaName]
+    ,[indexName]
+    ,[databaseID]
+    ,[objectID]
+    ,[indexID]
+    ,[PageCount]
+    ,[AvgFragmentationPercentage]
+    ,[reorganizationOrRebuildCommand]
+    ,[actionType]
+)
+SELECT
+     DB_NAME()                          AS [dbName]
+    ,tbl.name                           AS [tableName]
+    ,SCHEMA_NAME(tbl.schema_id)         AS [schemaName]
+    ,idx.Name                           AS [indexName]
+    ,pst.database_id                    AS [databaseID]
+    ,pst.object_id                      AS [objectID]
+    ,pst.index_id                       AS [indexID]
+    ,pst.page_count                     AS [PageCount]
+    ,pst.avg_fragmentation_in_percent   AS [AvgFragmentationPercentage]
+    ,CASE
+        WHEN pst.avg_fragmentation_in_percent > 30 THEN
+            ''ALTER INDEX [''+idx.Name+''] ON [''+DB_NAME()+''].[''+SCHEMA_NAME(tbl.schema_id)+''].[''+tbl.name+'']
+             REBUILD WITH (FILLFACTOR = ' + CAST(@indexFillFactor AS VARCHAR(5)) + ',
+             SORT_IN_TEMPDB = ' + @sortInTempdb + ', STATISTICS_NORECOMPUTE = OFF);''
+        WHEN pst.avg_fragmentation_in_percent > 5 AND pst.avg_fragmentation_in_percent <= 30 THEN
+            ''ALTER INDEX [''+idx.Name+''] ON [''+DB_NAME()+''].[''+SCHEMA_NAME(tbl.schema_id)+''].[''+tbl.name+''] REORGANIZE;''
+        ELSE NULL
+     END                                AS [reorganizationOrRebuildCommand]
+    ,CASE
+        WHEN pst.avg_fragmentation_in_percent > 30 THEN ''REBUILD''
+        WHEN pst.avg_fragmentation_in_percent > 5  THEN ''REORGANIZE''
+        ELSE NULL
+     END                                AS [actionType]
+FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, ''' + @indexStatisticsScanningMode + N''') AS pst
+INNER JOIN sys.tables  AS tbl ON pst.object_id = tbl.object_id
+INNER JOIN sys.indexes AS idx ON pst.object_id = idx.object_id
+                              AND pst.index_id  = idx.index_id
+WHERE pst.index_id != 0
+  AND pst.page_count > 500
+  AND pst.alloc_unit_type_desc IN (N''IN_ROW_DATA'', N''ROW_OVERFLOW_DATA'')
+  AND pst.avg_fragmentation_in_percent >= ' + CAST(@fragmentationThreshold AS VARCHAR(10)) -- FIX #8: CAST numeric type
+
+        IF @verboseMode = 1
+        BEGIN
+            PRINT 'Index fragmentation statistics script:'
+            PRINT @dynamic_command_get_tables
+        END
+
+        EXEC (@dynamic_command_get_tables)
+
+        FETCH NEXT FROM dbNames_cursor INTO @dbname, @dbid
+    END
+
+    CLOSE dbNames_cursor
+    DEALLOCATE dbNames_cursor
+
+    -- --------------------------------------------------------
+    -- Report Mode
+    -- --------------------------------------------------------
+    IF @reportOnly = 1
+    BEGIN
+        SELECT
+             dbName
+            ,tableName
+            ,schemaName
+            ,indexName
+            ,actionType
+            ,[PageCount]
+            ,CAST(AvgFragmentationPercentage AS DECIMAL(5,2)) AS AvgFragmentationPercentage
+        FROM #tmpFragmentedIndexes
+        WHERE AvgFragmentationPercentage >= @fragmentationThreshold
+        ORDER BY AvgFragmentationPercentage DESC
+    END
+
+    -- --------------------------------------------------------
+    -- Execute Mode
+    -- --------------------------------------------------------
+    ELSE
+    BEGIN
+        DECLARE reorganizeOrRebuildCommands_cursor CURSOR FOR
+        SELECT reorganizationOrRebuildCommand, actionType
+        FROM #tmpFragmentedIndexes
+        WHERE reorganizationOrRebuildCommand IS NOT NULL
+        ORDER BY AvgFragmentationPercentage DESC
+
+        DECLARE @actionType VARCHAR(20)
+
+        OPEN reorganizeOrRebuildCommands_cursor
+
+        FETCH NEXT FROM reorganizeOrRebuildCommands_cursor
+        INTO @ReorganizeOrRebuildCommand, @actionType
+
+        WHILE @@fetch_status = 0
+        BEGIN
+            IF @verboseMode = 1
+            BEGIN
+                PRINT ''
+                PRINT 'Executing: ' + @actionType
+                PRINT @ReorganizeOrRebuildCommand
+            END
+
+            BEGIN TRY
+                EXEC (@ReorganizeOrRebuildCommand)
+
+           
+            END TRY
+            BEGIN CATCH
+                SET @ErrorMessage = ERROR_MESSAGE()
+                PRINT 'WARNING: Failed to execute maintenance command.'
+                PRINT 'Command : ' + @ReorganizeOrRebuildCommand
+                PRINT 'Error   : ' + @ErrorMessage
+                PRINT 'Continuing with next index...'
+                -- Log to a table in production environments for audit purposes
+            END CATCH
+
+            FETCH NEXT FROM reorganizeOrRebuildCommands_cursor
+            INTO @ReorganizeOrRebuildCommand, @actionType
+        END
+
+        CLOSE reorganizeOrRebuildCommands_cursor
+        DEALLOCATE reorganizeOrRebuildCommands_cursor
+
+        PRINT ''
+        PRINT 'Index maintenance complete. All fragmented indexes have been reorganized/rebuilt.'
+        PRINT ''
+    END
+
+    -- Cleanup
+    DROP TABLE IF EXISTS #tmpFragmentedIndexes
+
+END
+ELSE
+BEGIN
+    PRINT ''
+    PRINT 'Error: You must be a member of the sysadmin role to run this script.'
+    PRINT ''
+END
